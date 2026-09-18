@@ -1,12 +1,26 @@
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 
 WELCOME_MESSAGE = """سلام 👋 ومرحبا بيك في YSF Bot 🤖
@@ -16,6 +30,19 @@ WELCOME_MESSAGE = """سلام 👋 ومرحبا بيك في YSF Bot 🤖
 DATABASE_PATH = Path(__file__).with_name("ysf_bot.db")
 DAILY_COOLDOWN_SECONDS = 24 * 60 * 60
 REFERRAL_PREFIX = "ref_"
+SHOP_MENU_BUTTON = "🛒 متجر YSF"
+SHOP_PRODUCT_CALLBACK_PREFIX = "shop:product:"
+SHOP_PURCHASE_CALLBACK_PREFIX = "shop:buy:"
+SHOP_MENU_CALLBACK = "shop:menu"
+
+SHOP_PRODUCTS = {
+    "diamonds_100": ("💎 100 Diamonds", "4 DT"),
+    "diamonds_200": ("💎 200 Diamonds", "8 DT"),
+    "diamonds_300": ("💎 300 Diamonds", "12 DT"),
+    "diamonds_500": ("💎 500 Diamonds", "19 DT"),
+    "weekly_membership": ("📅 Weekly membership", "2 Orange cards"),
+    "monthly_membership": ("📅 Monthly membership", "10 Orange cards"),
+}
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +236,62 @@ def format_remaining_time(seconds: int) -> str:
     return f"{remaining_minutes} د"
 
 
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[SHOP_MENU_BUTTON]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def shop_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"{product_name} — {price}",
+                    callback_data=f"{SHOP_PRODUCT_CALLBACK_PREFIX}{product_id}",
+                )
+            ]
+            for product_id, (product_name, price) in SHOP_PRODUCTS.items()
+        ]
+    )
+
+
+def product_keyboard(product_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🛒 شراء",
+                    callback_data=f"{SHOP_PURCHASE_CALLBACK_PREFIX}{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ رجوع للمتجر",
+                    callback_data=SHOP_MENU_CALLBACK,
+                )
+            ],
+        ]
+    )
+
+
+def get_product_from_callback(
+    callback_data: Optional[str], prefix: str
+) -> Optional[tuple[str, str, str]]:
+    if not callback_data or not callback_data.startswith(prefix):
+        return None
+
+    product_id = callback_data[len(prefix) :]
+    product = SHOP_PRODUCTS.get(product_id)
+    if product is None:
+        return None
+
+    product_name, price = product
+    return product_id, product_name, price
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Register the user, process an optional referral, then welcome them."""
     if update.message is None:
@@ -226,7 +309,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if inviter_id is not None and store.add_referral(user_id, inviter_id):
             logger.info("Processed a referral for user %s", user_id)
 
-    await update.message.reply_text(WELCOME_MESSAGE)
+    await update.message.reply_text(
+        WELCOME_MESSAGE,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def points(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -298,7 +384,82 @@ async def help_command(
         "/points — شوف قداش عندك نقاط\n"
         "/invite — خرّج رابط الدعوة متاعك\n"
         "/daily — خذ نقطة كل 24 ساعة\n"
+        "🛒 متجر YSF — تصفّح المنتجات\n"
         "/help — شوف المساعدة"
+    )
+
+
+async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    await update.message.reply_text(
+        "🛒 متجر YSF\nاختار المنتج اللي تحب عليه:",
+        reply_markup=shop_keyboard(),
+    )
+
+
+async def shop_product_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    product = get_product_from_callback(
+        query.data, SHOP_PRODUCT_CALLBACK_PREFIX
+    )
+    if product is None:
+        await query.edit_message_text(
+            "المنتج هذا ما عادش موجود في المتجر."
+        )
+        return
+
+    product_id, product_name, price = product
+    await query.edit_message_text(
+        f"{product_name}\nالسعر: {price}\n\n"
+        "اضغط على شراء باش تكمل الطلب.",
+        reply_markup=product_keyboard(product_id),
+    )
+
+
+async def shop_purchase_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    product = get_product_from_callback(
+        query.data, SHOP_PURCHASE_CALLBACK_PREFIX
+    )
+    if product is None:
+        await query.edit_message_text(
+            "المنتج هذا ما عادش موجود في المتجر."
+        )
+        return
+
+    _, product_name, price = product
+    await query.edit_message_text(
+        f"طلبك: {product_name}\nالسعر: {price}\n\n"
+        "باش تكمل الطلب، تواصل مع أدمن البوت.\n"
+        "الدفع والطلب يتمّوا يدويًا في الوقت الحالي."
+    )
+
+
+async def shop_menu_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+    await query.edit_message_text(
+        "🛒 متجر YSF\nاختار المنتج اللي تحب عليه:",
+        reply_markup=shop_keyboard(),
     )
 
 
@@ -330,6 +491,31 @@ def build_application(
     application.add_handler(CommandHandler("invite", invite))
     application.add_handler(CommandHandler("daily", daily))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & filters.Regex(f"^{re.escape(SHOP_MENU_BUTTON)}$"),
+            show_shop,
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            shop_product_callback,
+            pattern=f"^{re.escape(SHOP_PRODUCT_CALLBACK_PREFIX)}",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            shop_purchase_callback,
+            pattern=f"^{re.escape(SHOP_PURCHASE_CALLBACK_PREFIX)}",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            shop_menu_callback,
+            pattern=f"^{re.escape(SHOP_MENU_CALLBACK)}$",
+        )
+    )
     return application
 
 

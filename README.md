@@ -21,4 +21,8 @@ Open the bot in Telegram and use:
 - `/points` — current points and successful referral count
 - `/invite` — personal referral link
 - `/daily` — claim one point every 24 hours
+- `🛒 متجر YSF` — browse products and request a manual order
 - `/help` — command help
+
+Payments are not processed automatically. Selecting `🛒 شراء` tells the user
+to contact the bot administrator to complete the order manually.

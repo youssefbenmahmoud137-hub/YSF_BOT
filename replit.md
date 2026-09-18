@@ -37,6 +37,7 @@ _Populate as you build — non-obvious choices a reader couldn't infer from the 
 - Telegram bot named YSF Bot
 - `/start` sends the welcome message in Tunisian Arabic
 - `/points`, `/invite`, `/daily`, and `/help` provide the points and referral system
+- `🛒 متجر YSF` opens the product shop; purchases are completed manually by the administrator
 
 ## User preferences
 
