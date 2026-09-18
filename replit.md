@@ -1,15 +1,17 @@
-# [Project name]
+# YSF Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+YSF Bot is a simple Python Telegram bot that welcomes users in Tunisian Arabic when they send `/start`.
 
 ## Run & Operate
 
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `python main.py` — run YSF Bot using the `TELEGRAM_BOT_TOKEN` secret
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required env: `DATABASE_URL` — Postgres connection string for the API server
+- Required secret: `TELEGRAM_BOT_TOKEN` — token for YSF Bot
 
 ## Stack
 
@@ -22,7 +24,8 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `main.py` — YSF Bot entrypoint and `/start` handler
+- `README.md` — bot setup and run instructions
 
 ## Architecture decisions
 
@@ -30,7 +33,8 @@ _Populate as you build — non-obvious choices a reader couldn't infer from the 
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Telegram bot named YSF Bot
+- `/start` sends the welcome message in Tunisian Arabic
 
 ## User preferences
 
