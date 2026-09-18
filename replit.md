@@ -1,6 +1,6 @@
 # YSF Bot
 
-YSF Bot is a simple Python Telegram bot that welcomes users in Tunisian Arabic when they send `/start`.
+YSF Bot is a simple Python Telegram bot that welcomes users in Tunisian Arabic and supports persistent points, referrals, and daily rewards.
 
 ## Run & Operate
 
@@ -25,6 +25,7 @@ YSF Bot is a simple Python Telegram bot that welcomes users in Tunisian Arabic w
 ## Where things live
 
 - `main.py` — YSF Bot entrypoint and `/start` handler
+- `ysf_bot.db` — local SQLite database created at runtime for user points and rewards
 - `README.md` — bot setup and run instructions
 
 ## Architecture decisions
@@ -35,6 +36,7 @@ _Populate as you build — non-obvious choices a reader couldn't infer from the 
 
 - Telegram bot named YSF Bot
 - `/start` sends the welcome message in Tunisian Arabic
+- `/points`, `/invite`, `/daily`, and `/help` provide the points and referral system
 
 ## User preferences
 

@@ -9,6 +9,7 @@ __pycache__/
 *.py[cod]
 .pythonlibs/
 .venv/
+ysf_bot.db
 .expo
 .expo-shared
 
