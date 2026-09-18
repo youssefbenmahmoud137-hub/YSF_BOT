@@ -12,6 +12,7 @@ YSF Bot is a simple Python Telegram bot that welcomes users in Tunisian Arabic a
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required env: `DATABASE_URL` — Postgres connection string for the API server
 - Required secret: `TELEGRAM_BOT_TOKEN` — token for YSF Bot
+- Required secret: `ADMIN_ID` — Telegram ID that receives private pending-order notifications
 
 ## Stack
 
@@ -25,7 +26,7 @@ YSF Bot is a simple Python Telegram bot that welcomes users in Tunisian Arabic a
 ## Where things live
 
 - `main.py` — YSF Bot entrypoint and `/start` handler
-- `ysf_bot.db` — local SQLite database created at runtime for user points and rewards
+- `ysf_bot.db` — local SQLite database created at runtime for users, checkout sessions, and orders
 - `README.md` — bot setup and run instructions
 
 ## Architecture decisions
@@ -38,6 +39,7 @@ _Populate as you build — non-obvious choices a reader couldn't infer from the 
 - `/start` sends the welcome message in Tunisian Arabic
 - `/points`, `/invite`, `/daily`, and `/help` provide the points and referral system
 - `🛒 متجر YSF` opens the product shop; purchases are completed manually by the administrator
+- Orders collect a Game ID and payment reference in private chat, then notify the configured admin with `pending` status
 
 ## User preferences
 

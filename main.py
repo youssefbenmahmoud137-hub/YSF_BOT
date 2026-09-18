@@ -13,6 +13,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.constants import ChatType
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -34,6 +35,8 @@ SHOP_MENU_BUTTON = "🛒 متجر YSF"
 SHOP_PRODUCT_CALLBACK_PREFIX = "shop:product:"
 SHOP_PURCHASE_CALLBACK_PREFIX = "shop:buy:"
 SHOP_MENU_CALLBACK = "shop:menu"
+SHOP_CANCEL_CALLBACK = "shop:cancel"
+MAX_PAYMENT_INFO_LENGTH = 1000
 
 SHOP_PRODUCTS = {
     "diamonds_100": ("💎 100 Diamonds", "4 DT"),
@@ -48,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 class UserStore:
-    """Persistent SQLite storage for points, referrals, and daily claims."""
+    """Persistent SQLite storage for users, checkouts, and orders."""
 
     def __init__(self, path: Path = DATABASE_PATH) -> None:
         self.path = path
@@ -71,6 +74,32 @@ class UserStore:
                     last_daily_claim_at INTEGER,
                     has_been_referred INTEGER NOT NULL DEFAULT 0
                         CHECK (has_been_referred IN (0, 1))
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_checkouts (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    product_id TEXT NOT NULL,
+                    product_name TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    game_id TEXT,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_user_id INTEGER NOT NULL,
+                    telegram_username TEXT,
+                    product TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    game_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
                 )
                 """
             )
@@ -203,6 +232,155 @@ class UserStore:
             )
             return True, 0
 
+    def start_checkout(
+        self,
+        telegram_user_id: int,
+        product_id: str,
+        product_name: str,
+        price: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO pending_checkouts (
+                    telegram_user_id,
+                    product_id,
+                    product_name,
+                    price,
+                    game_id,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    product_id = excluded.product_id,
+                    product_name = excluded.product_name,
+                    price = excluded.price,
+                    game_id = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    telegram_user_id,
+                    product_id,
+                    product_name,
+                    price,
+                    int(datetime.now(timezone.utc).timestamp()),
+                ),
+            )
+
+    def get_pending_checkout(
+        self, telegram_user_id: int
+    ) -> Optional[tuple[str, str, str, Optional[str]]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT product_id, product_name, price, game_id
+                FROM pending_checkouts
+                WHERE telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+        return (
+            str(row["product_id"]),
+            str(row["product_name"]),
+            str(row["price"]),
+            str(row["game_id"]) if row["game_id"] is not None else None,
+        )
+
+    def set_checkout_game_id(
+        self, telegram_user_id: int, game_id: str
+    ) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE pending_checkouts
+                SET game_id = ?,
+                    updated_at = ?
+                WHERE telegram_user_id = ?
+                  AND game_id IS NULL
+                """,
+                (
+                    game_id,
+                    int(datetime.now(timezone.utc).timestamp()),
+                    telegram_user_id,
+                ),
+            )
+            return updated.rowcount == 1
+
+    def create_order(
+        self,
+        telegram_user_id: int,
+        telegram_username: Optional[str],
+    ) -> Optional[tuple[int, str, str, str]]:
+        """Create one pending order and remove its completed checkout session."""
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            checkout = connection.execute(
+                """
+                SELECT product_name AS product, price, game_id
+                FROM pending_checkouts
+                WHERE telegram_user_id = ?
+                  AND game_id IS NOT NULL
+                """,
+                (telegram_user_id,),
+            ).fetchone()
+            if checkout is None:
+                return None
+
+            created = connection.execute(
+                """
+                INSERT INTO orders (
+                    telegram_user_id,
+                    telegram_username,
+                    product,
+                    price,
+                    game_id,
+                    created_at,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                """,
+                (
+                    telegram_user_id,
+                    telegram_username,
+                    checkout["product"],
+                    checkout["price"],
+                    checkout["game_id"],
+                    created_at,
+                ),
+            )
+            if created.lastrowid is None:
+                raise RuntimeError("Order number was not generated.")
+
+            connection.execute(
+                """
+                DELETE FROM pending_checkouts
+                WHERE telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            )
+            return (
+                int(created.lastrowid),
+                str(checkout["product"]),
+                str(checkout["price"]),
+                str(checkout["game_id"]),
+            )
+
+    def cancel_checkout(self, telegram_user_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM pending_checkouts
+                WHERE telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            )
+
 
 def get_store(context: ContextTypes.DEFAULT_TYPE) -> UserStore:
     store = context.application.bot_data.get("store")
@@ -269,8 +447,8 @@ def product_keyboard(product_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    "⬅️ رجوع للمتجر",
-                    callback_data=SHOP_MENU_CALLBACK,
+                    "❌ إلغاء الطلب",
+                    callback_data=SHOP_CANCEL_CALLBACK,
                 )
             ],
         ]
@@ -290,6 +468,57 @@ def get_product_from_callback(
 
     product_name, price = product
     return product_id, product_name, price
+
+
+def is_private_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.type == ChatType.PRIVATE
+
+
+def parse_game_id(text: str) -> Optional[str]:
+    match = re.fullmatch(r"id:\s*([0-9]+)", text.strip(), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def parse_admin_id(raw_admin_id: Optional[str]) -> int:
+    if not raw_admin_id:
+        raise RuntimeError(
+            "ADMIN_ID is not configured. Add the Telegram admin ID as a Replit Secret."
+        )
+
+    try:
+        admin_id = int(raw_admin_id)
+    except ValueError as error:
+        raise RuntimeError("ADMIN_ID must be a numeric Telegram user ID.") from error
+
+    if admin_id <= 0:
+        raise RuntimeError("ADMIN_ID must be a positive Telegram user ID.")
+    return admin_id
+
+
+def order_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "❌ إلغاء الطلب",
+                    callback_data=SHOP_CANCEL_CALLBACK,
+                )
+            ]
+        ]
+    )
+
+
+def order_payment_prompt(
+    product_name: str, price: str
+) -> str:
+    return (
+        f"{product_name}\n"
+        f"السعر: {price}\n\n"
+        "⚠️ يلزمك تخلّص قبل إتمام الطلب.\n"
+        "بعد الدفع، ابعث الـID متاعك بالشكل:\n"
+        "id: 123456789"
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -406,6 +635,13 @@ async def shop_product_callback(
     if query is None:
         return
 
+    if not is_private_chat(update):
+        await query.answer(
+            "الشراء متاح في المحادثة الخاصة مع البوت فقط.",
+            show_alert=True,
+        )
+        return
+
     await query.answer()
     product = get_product_from_callback(
         query.data, SHOP_PRODUCT_CALLBACK_PREFIX
@@ -417,9 +653,18 @@ async def shop_product_callback(
         return
 
     product_id, product_name, price = product
+    user_id = get_telegram_user_id(update)
+    if user_id is None:
+        return
+
+    get_store(context).start_checkout(
+        user_id,
+        product_id,
+        product_name,
+        price,
+    )
     await query.edit_message_text(
-        f"{product_name}\nالسعر: {price}\n\n"
-        "اضغط على شراء باش تكمل الطلب.",
+        order_payment_prompt(product_name, price),
         reply_markup=product_keyboard(product_id),
     )
 
@@ -429,6 +674,13 @@ async def shop_purchase_callback(
 ) -> None:
     query = update.callback_query
     if query is None:
+        return
+
+    if not is_private_chat(update):
+        await query.answer(
+            "الشراء متاح في المحادثة الخاصة مع البوت فقط.",
+            show_alert=True,
+        )
         return
 
     await query.answer()
@@ -441,11 +693,20 @@ async def shop_purchase_callback(
         )
         return
 
-    _, product_name, price = product
+    product_id, product_name, price = product
+    user_id = get_telegram_user_id(update)
+    if user_id is None:
+        return
+
+    get_store(context).start_checkout(
+        user_id,
+        product_id,
+        product_name,
+        price,
+    )
     await query.edit_message_text(
-        f"طلبك: {product_name}\nالسعر: {price}\n\n"
-        "باش تكمل الطلب، تواصل مع أدمن البوت.\n"
-        "الدفع والطلب يتمّوا يدويًا في الوقت الحالي."
+        order_payment_prompt(product_name, price),
+        reply_markup=order_cancel_keyboard(),
     )
 
 
@@ -456,10 +717,150 @@ async def shop_menu_callback(
     if query is None:
         return
 
+    if not is_private_chat(update):
+        await query.answer(
+            "المتجر متاح في المحادثة الخاصة مع البوت فقط.",
+            show_alert=True,
+        )
+        return
+
     await query.answer()
     await query.edit_message_text(
         "🛒 متجر YSF\nاختار المنتج اللي تحب عليه:",
         reply_markup=shop_keyboard(),
+    )
+
+
+async def shop_cancel_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    if not is_private_chat(update):
+        await query.answer(
+            "إلغاء الطلب متاح في المحادثة الخاصة مع البوت فقط.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer()
+    user_id = get_telegram_user_id(update)
+    if user_id is not None:
+        get_store(context).cancel_checkout(user_id)
+
+    await query.edit_message_text(
+        "تم إلغاء الطلب. تنجم ترجع للمتجر وقت اللي تحب.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "⬅️ رجوع للمتجر",
+                        callback_data=SHOP_MENU_CALLBACK,
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+async def handle_order_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Collect the game ID and payment info in a private chat only."""
+    if update.message is None or not is_private_chat(update):
+        return
+
+    user_id = get_telegram_user_id(update)
+    if user_id is None:
+        return
+
+    pending = get_store(context).get_pending_checkout(user_id)
+    if pending is None:
+        return
+
+    text = update.message.text.strip()
+    _, _, _, game_id = pending
+
+    if game_id is None:
+        parsed_game_id = parse_game_id(text)
+        if parsed_game_id is None:
+            await update.message.reply_text(
+                "الصيغة غالطة.\n"
+                "ابعث الـID بالشكل هذا:\n"
+                "id: 123456789"
+            )
+            return
+
+        if not get_store(context).set_checkout_game_id(
+            user_id, parsed_game_id
+        ):
+            await update.message.reply_text(
+                "تعذّر حفظ الـID. عاود المحاولة من المتجر."
+            )
+            return
+
+        await update.message.reply_text(
+            "مريقل، وصلني الـID متاعك.\n"
+            "توا ابعث رمز/معلومة الدفع المطلوبة باش نكمّلوا الطلب."
+        )
+        return
+
+    if not text or len(text) > MAX_PAYMENT_INFO_LENGTH:
+        await update.message.reply_text(
+            f"ابعث معلومة دفع واضحة وما تفوتش {MAX_PAYMENT_INFO_LENGTH} حرف."
+        )
+        return
+
+    username = update.effective_user.username
+    store = get_store(context)
+    order = store.create_order(user_id, username)
+    if order is None:
+        await update.message.reply_text(
+            "ما لقيناش طلب قاعد. عاود اختار المنتج من المتجر."
+        )
+        return
+
+    order_number, stored_product, stored_price, stored_game_id = order
+    admin_id = context.application.bot_data.get("admin_id")
+    if not isinstance(admin_id, int):
+        logger.error("ADMIN_ID is not configured; order #%s was created.", order_number)
+        await update.message.reply_text(
+            "تسجّل الطلب، أما صار مشكل في إعلام الأدمن. حاول تتصل بالإدارة."
+        )
+        return
+
+    admin_username = f"@{username}" if username else "غير متوفر"
+    admin_message = (
+        "🛒 طلب شراء جديد\n"
+        f"رقم الطلب: #{order_number}\n"
+        f"المنتج: {stored_product}\n"
+        f"السعر: {stored_price}\n"
+        f"ID اللعبة: {stored_game_id}\n"
+        f"Telegram user ID: {user_id}\n"
+        f"Username: {admin_username}\n"
+        f"معلومة الدفع: {text}\n"
+        "الحالة: pending"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=admin_message,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to notify admin for order #%s.", order_number
+        )
+        await update.message.reply_text(
+            f"تسجّل طلبك #{order_number}، أما صار مشكل في إعلام الأدمن."
+        )
+        return
+
+    await update.message.reply_text(
+        f"تم تسجيل طلبك بنجاح ✅\nرقم الطلب متاعك: #{order_number}\n"
+        "الإدارة باش تراجع الطلب وتكمّل الشحن يدويًا."
     )
 
 
@@ -476,7 +877,9 @@ async def register_commands(application: Application) -> None:
 
 
 def build_application(
-    token: str, store: Optional[UserStore] = None
+    token: str,
+    store: Optional[UserStore] = None,
+    admin_id: Optional[int] = None,
 ) -> Application:
     """Create the bot application, storage, and command handlers."""
     application = (
@@ -486,6 +889,7 @@ def build_application(
         .build()
     )
     application.bot_data["store"] = store or UserStore()
+    application.bot_data["admin_id"] = admin_id
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("points", points))
     application.add_handler(CommandHandler("invite", invite))
@@ -493,9 +897,16 @@ def build_application(
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(
         MessageHandler(
-            filters.TEXT
+            filters.ChatType.PRIVATE
+            & filters.TEXT
             & filters.Regex(f"^{re.escape(SHOP_MENU_BUTTON)}$"),
             show_shop,
+        )
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
+            handle_order_message,
         )
     )
     application.add_handler(
@@ -514,6 +925,12 @@ def build_application(
         CallbackQueryHandler(
             shop_menu_callback,
             pattern=f"^{re.escape(SHOP_MENU_CALLBACK)}$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            shop_cancel_callback,
+            pattern=f"^{re.escape(SHOP_CANCEL_CALLBACK)}$",
         )
     )
     return application
@@ -535,7 +952,8 @@ def main() -> None:
     logging.getLogger("telegram").setLevel(logging.WARNING)
     logger.info("Starting YSF Bot")
 
-    application = build_application(token)
+    admin_id = parse_admin_id(os.getenv("ADMIN_ID"))
+    application = build_application(token, admin_id=admin_id)
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,

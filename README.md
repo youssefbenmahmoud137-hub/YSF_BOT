@@ -9,6 +9,9 @@ The bot reads its token from the `TELEGRAM_BOT_TOKEN` environment secret.
 Create or manage the token with [@BotFather](https://t.me/BotFather) on
 Telegram, then add it as a Replit Secret with that exact name.
 
+The admin Telegram user ID is read from the `ADMIN_ID` secret. New orders are
+saved in SQLite with a `pending` status and sent privately to that admin.
+
 ## Run
 
 Start the `YSF Bot` workflow. The bot uses long polling, so no public webhook
@@ -24,5 +27,6 @@ Open the bot in Telegram and use:
 - `🛒 متجر YSF` — browse products and request a manual order
 - `/help` — command help
 
-Payments are not processed automatically. Selecting `🛒 شراء` tells the user
-to contact the bot administrator to complete the order manually.
+Payments are not processed automatically. Selecting `🛒 شراء` starts a private
+checkout flow that validates the Game ID, collects the payment reference, and
+sends the pending order to the administrator for manual review.
