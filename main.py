@@ -4,8 +4,10 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Thread
 from typing import Optional
 
+from flask import Flask
 from telegram import (
     BotCommand,
     ForceReply,
@@ -52,6 +54,17 @@ SHOP_PRODUCTS = {
 }
 
 logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home() -> str:
+    return "البوت خدام!"
+
+
+def run_health_server() -> None:
+    app.run(host="0.0.0.0", port=8080)
 
 
 class UserStore:
@@ -1587,6 +1600,7 @@ def main() -> None:
 
     admin_id = parse_admin_id(os.getenv("ADMIN_ID"))
     application = build_application(token, admin_id=admin_id)
+    Thread(target=run_health_server, daemon=True).start()
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
