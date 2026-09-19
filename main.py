@@ -45,12 +45,12 @@ MAX_PAYMENT_INFO_LENGTH = 1000
 MAX_REJECTION_REASON_LENGTH = 1000
 
 SHOP_PRODUCTS = {
-    "diamonds_100": ("💎 100 Diamonds", "4 DT"),
-    "diamonds_200": ("💎 200 Diamonds", "8 DT"),
-    "diamonds_300": ("💎 300 Diamonds", "12 DT"),
-    "diamonds_500": ("💎 500 Diamonds", "19 DT"),
-    "weekly_membership": ("📅 Weekly membership", "2 Orange cards"),
-    "monthly_membership": ("📅 Monthly membership", "10 Orange cards"),
+    "diamonds_100": ("💎 100 جوهرة", "4 د.ت"),
+    "diamonds_200": ("💎 200 جوهرة", "8 د.ت"),
+    "diamonds_300": ("💎 300 جوهرة", "12 د.ت"),
+    "diamonds_500": ("💎 500 جوهرة", "19 د.ت"),
+    "weekly_membership": ("📅 اشتراك أسبوعي", "2 بطاقة أورونج"),
+    "monthly_membership": ("📅 اشتراك شهري", "10 بطاقات أورونج"),
 }
 
 logger = logging.getLogger(__name__)
@@ -732,17 +732,15 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 def shop_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"{product_name} — {price}",
-                    callback_data=f"{SHOP_PRODUCT_CALLBACK_PREFIX}{product_id}",
-                )
-            ]
-            for product_id, (product_name, price) in SHOP_PRODUCTS.items()
-        ]
-    )
+    buttons = [
+        InlineKeyboardButton(
+            f"{product_name} — {price}",
+            callback_data=f"{SHOP_PRODUCT_CALLBACK_PREFIX}{product_id}",
+        )
+        for product_id, (product_name, price) in SHOP_PRODUCTS.items()
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(rows)
 
 
 def product_keyboard(product_id: str) -> InlineKeyboardMarkup:
@@ -895,7 +893,7 @@ def order_admin_message(
         f"Telegram user ID: {user_id}\n"
         f"Username: {username}\n"
         f"معلومة الدفع: {payment_info}\n"
-        "الحالة: pending"
+        "الحالة: ⏳ قيد التأكيد"
     )
 
 
