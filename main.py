@@ -8,6 +8,7 @@ from typing import Optional
 
 from telegram import (
     BotCommand,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -109,14 +110,64 @@ class UserStore:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS pending_admin_rejections (
-                    admin_id INTEGER PRIMARY KEY,
-                    order_number INTEGER NOT NULL,
+                    pending_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admin_id INTEGER NOT NULL,
+                    order_number INTEGER NOT NULL UNIQUE,
                     admin_chat_id INTEGER NOT NULL,
                     admin_message_id INTEGER NOT NULL,
+                    prompt_message_id INTEGER,
                     created_at INTEGER NOT NULL
                 )
                 """
             )
+            rejection_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(pending_admin_rejections)"
+                )
+            }
+            if "pending_id" not in rejection_columns:
+                connection.execute(
+                    """
+                    CREATE TABLE pending_admin_rejections_new (
+                        pending_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        admin_id INTEGER NOT NULL,
+                        order_number INTEGER NOT NULL UNIQUE,
+                        admin_chat_id INTEGER NOT NULL,
+                        admin_message_id INTEGER NOT NULL,
+                        prompt_message_id INTEGER,
+                        created_at INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO pending_admin_rejections_new (
+                        admin_id,
+                        order_number,
+                        admin_chat_id,
+                        admin_message_id,
+                        prompt_message_id,
+                        created_at
+                    )
+                    SELECT admin_id,
+                           order_number,
+                           admin_chat_id,
+                           admin_message_id,
+                           NULL,
+                           created_at
+                    FROM pending_admin_rejections
+                    """
+                )
+                connection.execute(
+                    "DROP TABLE pending_admin_rejections"
+                )
+                connection.execute(
+                    """
+                    ALTER TABLE pending_admin_rejections_new
+                    RENAME TO pending_admin_rejections
+                    """
+                )
             order_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(orders)")
@@ -477,11 +528,12 @@ class UserStore:
                     order_number,
                     admin_chat_id,
                     admin_message_id,
+                    prompt_message_id,
                     created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(admin_id) DO UPDATE SET
-                    order_number = excluded.order_number,
+                VALUES (?, ?, ?, ?, NULL, ?)
+                ON CONFLICT(order_number) DO UPDATE SET
+                    admin_id = excluded.admin_id,
                     admin_chat_id = excluded.admin_chat_id,
                     admin_message_id = excluded.admin_message_id,
                     created_at = excluded.created_at
@@ -496,27 +548,78 @@ class UserStore:
             )
             return dict(row)
 
-    def get_pending_admin_rejection(
-        self, admin_id: int
-    ) -> Optional[dict[str, object]]:
+    def set_rejection_prompt_message(
+        self, admin_id: int, order_number: int, prompt_message_id: int
+    ) -> bool:
         with self._connect() as connection:
-            row = connection.execute(
+            updated = connection.execute(
+                """
+                UPDATE pending_admin_rejections
+                SET prompt_message_id = ?
+                WHERE admin_id = ?
+                  AND order_number = ?
+                """,
+                (prompt_message_id, admin_id, order_number),
+            )
+            return updated.rowcount == 1
+
+    def get_pending_admin_rejections(
+        self, admin_id: int
+    ) -> list[dict[str, object]]:
+        with self._connect() as connection:
+            rows = connection.execute(
                 """
                 SELECT p.admin_id, p.order_number, p.admin_chat_id,
-                       p.admin_message_id,
+                       p.admin_message_id, p.prompt_message_id,
                        o.telegram_user_id,
                        o.telegram_username, o.product, o.price, o.game_id,
                        o.created_at, o.status, o.rejection_reason
                 FROM pending_admin_rejections AS p
                 JOIN orders AS o ON o.order_number = p.order_number
                 WHERE p.admin_id = ?
+                ORDER BY p.created_at ASC, p.pending_id ASC
                 """,
                 (admin_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_pending_admin_rejection(
+        self,
+        admin_id: int,
+        order_number: Optional[int] = None,
+        reply_message_id: Optional[int] = None,
+    ) -> Optional[dict[str, object]]:
+        clauses = ["p.admin_id = ?"]
+        parameters: list[object] = [admin_id]
+        if order_number is not None:
+            clauses.append("p.order_number = ?")
+            parameters.append(order_number)
+        if reply_message_id is not None:
+            clauses.append(
+                "(p.prompt_message_id = ? OR p.admin_message_id = ?)"
+            )
+            parameters.extend([reply_message_id, reply_message_id])
+
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT p.admin_id, p.order_number, p.admin_chat_id,
+                       p.admin_message_id, p.prompt_message_id,
+                       o.telegram_user_id,
+                       o.telegram_username, o.product, o.price, o.game_id,
+                       o.created_at, o.status, o.rejection_reason
+                FROM pending_admin_rejections AS p
+                JOIN orders AS o ON o.order_number = p.order_number
+                WHERE {" AND ".join(clauses)}
+                ORDER BY p.created_at DESC, p.pending_id DESC
+                LIMIT 1
+                """,
+                parameters,
             ).fetchone()
         return dict(row) if row is not None else None
 
     def reject_order(
-        self, admin_id: int, reason: str
+        self, admin_id: int, order_number: int, reason: str
     ) -> Optional[dict[str, object]]:
         """Store the rejection reason and mark the selected order rejected."""
         with self._connect() as connection:
@@ -530,8 +633,9 @@ class UserStore:
                 FROM pending_admin_rejections AS p
                 JOIN orders AS o ON o.order_number = p.order_number
                 WHERE p.admin_id = ?
+                  AND p.order_number = ?
                 """,
-                (admin_id,),
+                (admin_id, order_number),
             ).fetchone()
             if row is None or row["status"] != "pending":
                 return None
@@ -553,8 +657,9 @@ class UserStore:
                 """
                 DELETE FROM pending_admin_rejections
                 WHERE admin_id = ?
+                  AND order_number = ?
                 """,
-                (admin_id,),
+                (admin_id, order_number),
             )
             rejected = dict(row)
             rejected["status"] = "rejected"
@@ -1127,17 +1232,6 @@ async def admin_order_callback(
         await query.answer("تعذّر فتح الطلب.", show_alert=True)
         return
 
-    pending_rejection = store.get_pending_admin_rejection(admin_id)
-    if (
-        pending_rejection is not None
-        and int(pending_rejection["order_number"]) != order_number
-    ):
-        await query.answer(
-            "عندك طلب آخر يستنى سبب الرفض. ابعث السبب الأول.",
-            show_alert=True,
-        )
-        return
-
     order = store.begin_rejection(
         admin_id=admin_id,
         order_number=order_number,
@@ -1145,10 +1239,12 @@ async def admin_order_callback(
         admin_message_id=query.message.message_id,
     )
     if order is None:
-        pending_rejection = store.get_pending_admin_rejection(admin_id)
+        pending_rejection = store.get_pending_admin_rejection(
+            admin_id,
+            order_number=order_number,
+        )
         if (
             pending_rejection is not None
-            and int(pending_rejection["order_number"]) == order_number
         ):
             await query.answer(
                 "اكتب سبب عدم الشحن في رسالة هنا.",
@@ -1179,10 +1275,21 @@ async def admin_order_callback(
             order_number,
         )
 
-    await context.bot.send_message(
+    prompt_message = await context.bot.send_message(
         chat_id=admin_id,
-        text="✍️ اكتب سبب عدم الشحن، وسيتم إرساله للزبون.",
+        text="✍️ اكتب الآن سبب عدم الشحن، وسيتم إرساله للزبون.",
+        reply_to_message_id=query.message.message_id,
+        reply_markup=ForceReply(selective=True),
     )
+    if not store.set_rejection_prompt_message(
+        admin_id,
+        order_number,
+        prompt_message.message_id,
+    ):
+        logger.error(
+            "Failed to save rejection prompt for order #%s.",
+            order_number,
+        )
 
 
 async def handle_admin_rejection_message(
@@ -1197,7 +1304,25 @@ async def handle_admin_rejection_message(
         return False
 
     store = get_store(context)
-    pending = store.get_pending_admin_rejection(admin_id)
+    reply_message = update.message.reply_to_message
+    reply_message_id = (
+        reply_message.message_id if reply_message is not None else None
+    )
+    pending = store.get_pending_admin_rejection(
+        admin_id,
+        reply_message_id=reply_message_id,
+    )
+    if pending is None:
+        pending_rejections = store.get_pending_admin_rejections(admin_id)
+        if len(pending_rejections) == 1:
+            pending = pending_rejections[0]
+        elif len(pending_rejections) > 1:
+            await update.message.reply_text(
+                "عندك أكثر من طلب يستنى سبب الرفض. "
+                "استعمل Reply على رسالة السبب الخاصة بالطلب الصحيح."
+            )
+            return True
+
     if pending is None:
         return False
 
@@ -1213,7 +1338,8 @@ async def handle_admin_rejection_message(
         )
         return True
 
-    order = store.reject_order(admin_id, reason)
+    order_number = int(pending["order_number"])
+    order = store.reject_order(admin_id, order_number, reason)
     if order is None:
         await update.message.reply_text(
             "الطلب تمت معالجته مسبقًا."
