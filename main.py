@@ -56,6 +56,7 @@ SHOP_PRODUCTS = {
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+HEALTH_SERVER_PORT = int(os.getenv("YSF_HEALTH_PORT", "8082"))
 
 
 @app.route("/")
@@ -64,7 +65,7 @@ def home() -> str:
 
 
 def run_health_server() -> None:
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=HEALTH_SERVER_PORT)
 
 
 class UserStore:
