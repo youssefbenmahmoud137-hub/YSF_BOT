@@ -49,8 +49,8 @@ SHOP_PRODUCTS = {
     "diamonds_200": ("💎 200 جوهرة", "8 د.ت"),
     "diamonds_300": ("💎 300 جوهرة", "12 د.ت"),
     "diamonds_500": ("💎 500 جوهرة", "19 د.ت"),
-    "weekly_membership": ("📅 اشتراك أسبوعي", "2 بطاقة أورونج"),
-    "monthly_membership": ("📅 اشتراك شهري", "10 بطاقات أورونج"),
+    "weekly_membership": ("📅 أسبوعي", "بطاقتين أورونج"),
+    "monthly_membership": ("📅 شهري", "10 بطاقات أورونج"),
 }
 
 logger = logging.getLogger(__name__)
@@ -867,11 +867,12 @@ def order_payment_prompt(
     product_name: str, price: str
 ) -> str:
     return (
-        f"{product_name}\n"
-        f"السعر: {price}\n\n"
-        "⚠️ يلزمك تخلّص قبل إتمام الطلب.\n"
-        "بعد الدفع، ابعث الـID متاعك بالشكل:\n"
-        "id: 123456789"
+        f"🛒 {product_name}\n"
+        f"💰 السعر: {price}\n\n"
+        "⚠️ يلزمك تخلّص قبل إتمام الطلب.\n\n"
+        "1️⃣ بعد الدفع، ابعث الـID متاعك بالشكل هذا:\n"
+        "id: 123456789\n\n"
+        "2️⃣ من بعد نطلبو منك معلومة الدفع باش نكملو الطلب."
     )
 
 
@@ -1495,7 +1496,11 @@ async def handle_order_message(
         return
 
     await update.message.reply_text(
-        f"تم تسجيل طلبك بنجاح ✅\nرقم الطلب متاعك: #{order_number}\n"
+        "✅ تم تسجيل طلبك بنجاح!\n\n"
+        f"📦 رقم الطلب: #{order_number}\n"
+        f"🛒 المنتج: {stored_product}\n"
+        f"💰 السعر: {stored_price}\n"
+        f"🆔 ID اللعبة: {stored_game_id}\n\n"
         "الإدارة باش تراجع الطلب وتكمّل الشحن يدويًا."
     )
 
