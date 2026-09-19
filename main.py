@@ -36,7 +36,10 @@ SHOP_PRODUCT_CALLBACK_PREFIX = "shop:product:"
 SHOP_PURCHASE_CALLBACK_PREFIX = "shop:buy:"
 SHOP_MENU_CALLBACK = "shop:menu"
 SHOP_CANCEL_CALLBACK = "shop:cancel"
+ORDER_COMPLETE_CALLBACK_PREFIX = "order:complete:"
+ORDER_REJECT_CALLBACK_PREFIX = "order:reject:"
 MAX_PAYMENT_INFO_LENGTH = 1000
+MAX_REJECTION_REASON_LENGTH = 1000
 
 SHOP_PRODUCTS = {
     "diamonds_100": ("💎 100 Diamonds", "4 DT"),
@@ -103,6 +106,25 @@ class UserStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_admin_rejections (
+                    admin_id INTEGER PRIMARY KEY,
+                    order_number INTEGER NOT NULL,
+                    admin_chat_id INTEGER NOT NULL,
+                    admin_message_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            order_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(orders)")
+            }
+            if "rejection_reason" not in order_columns:
+                connection.execute(
+                    "ALTER TABLE orders ADD COLUMN rejection_reason TEXT"
+                )
 
     def ensure_user(self, telegram_user_id: int) -> None:
         with self._connect() as connection:
@@ -371,6 +393,174 @@ class UserStore:
                 str(checkout["game_id"]),
             )
 
+    def get_order(self, order_number: int) -> Optional[dict[str, object]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT order_number, telegram_user_id, telegram_username,
+                       product, price, game_id, created_at, status,
+                       rejection_reason
+                FROM orders
+                WHERE order_number = ?
+                """,
+                (order_number,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def complete_order(self, order_number: int) -> Optional[dict[str, object]]:
+        """Mark a pending order as completed exactly once."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT order_number, telegram_user_id, telegram_username,
+                       product, price, game_id, created_at, status,
+                       rejection_reason
+                FROM orders
+                WHERE order_number = ?
+                """,
+                (order_number,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+
+            updated = connection.execute(
+                """
+                UPDATE orders
+                SET status = 'completed'
+                WHERE order_number = ?
+                  AND status = 'pending'
+                """,
+                (order_number,),
+            )
+            if updated.rowcount != 1:
+                return None
+
+            connection.execute(
+                """
+                DELETE FROM pending_admin_rejections
+                WHERE order_number = ?
+                """,
+                (order_number,),
+            )
+            completed = dict(row)
+            completed["status"] = "completed"
+            return completed
+
+    def begin_rejection(
+        self,
+        admin_id: int,
+        order_number: int,
+        admin_chat_id: int,
+        admin_message_id: int,
+    ) -> Optional[dict[str, object]]:
+        """Put one pending order into the admin's reason-collection state."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT order_number, telegram_user_id, telegram_username,
+                       product, price, game_id, created_at, status,
+                       rejection_reason
+                FROM orders
+                WHERE order_number = ?
+                """,
+                (order_number,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+
+            connection.execute(
+                """
+                INSERT INTO pending_admin_rejections (
+                    admin_id,
+                    order_number,
+                    admin_chat_id,
+                    admin_message_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(admin_id) DO UPDATE SET
+                    order_number = excluded.order_number,
+                    admin_chat_id = excluded.admin_chat_id,
+                    admin_message_id = excluded.admin_message_id,
+                    created_at = excluded.created_at
+                """,
+                (
+                    admin_id,
+                    order_number,
+                    admin_chat_id,
+                    admin_message_id,
+                    int(datetime.now(timezone.utc).timestamp()),
+                ),
+            )
+            return dict(row)
+
+    def get_pending_admin_rejection(
+        self, admin_id: int
+    ) -> Optional[dict[str, object]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT p.admin_id, p.order_number, p.admin_chat_id,
+                       p.admin_message_id,
+                       o.telegram_user_id,
+                       o.telegram_username, o.product, o.price, o.game_id,
+                       o.created_at, o.status, o.rejection_reason
+                FROM pending_admin_rejections AS p
+                JOIN orders AS o ON o.order_number = p.order_number
+                WHERE p.admin_id = ?
+                """,
+                (admin_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def reject_order(
+        self, admin_id: int, reason: str
+    ) -> Optional[dict[str, object]]:
+        """Store the rejection reason and mark the selected order rejected."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT p.order_number, p.admin_chat_id, p.admin_message_id,
+                       o.telegram_user_id, o.telegram_username, o.product,
+                       o.price, o.game_id, o.created_at, o.status,
+                       o.rejection_reason
+                FROM pending_admin_rejections AS p
+                JOIN orders AS o ON o.order_number = p.order_number
+                WHERE p.admin_id = ?
+                """,
+                (admin_id,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+
+            updated = connection.execute(
+                """
+                UPDATE orders
+                SET status = 'rejected',
+                    rejection_reason = ?
+                WHERE order_number = ?
+                  AND status = 'pending'
+                """,
+                (reason, row["order_number"]),
+            )
+            if updated.rowcount != 1:
+                return None
+
+            connection.execute(
+                """
+                DELETE FROM pending_admin_rejections
+                WHERE admin_id = ?
+                """,
+                (admin_id,),
+            )
+            rejected = dict(row)
+            rejected["status"] = "rejected"
+            rejected["rejection_reason"] = reason
+            return rejected
+
     def cancel_checkout(self, telegram_user_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
@@ -509,6 +699,53 @@ def order_cancel_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def order_admin_keyboard(order_number: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ تم الشحن",
+                    callback_data=f"{ORDER_COMPLETE_CALLBACK_PREFIX}{order_number}",
+                ),
+                InlineKeyboardButton(
+                    "❌ لم يتم الشحن",
+                    callback_data=f"{ORDER_REJECT_CALLBACK_PREFIX}{order_number}",
+                ),
+            ]
+        ]
+    )
+
+
+def parse_order_number_callback(
+    callback_data: Optional[str], prefix: str
+) -> Optional[int]:
+    if not callback_data or not callback_data.startswith(prefix):
+        return None
+
+    raw_order_number = callback_data[len(prefix) :]
+    try:
+        order_number = int(raw_order_number)
+    except ValueError:
+        return None
+    return order_number if order_number > 0 else None
+
+
+def admin_order_status_text(
+    original_text: str,
+    status_text: str,
+    reason: Optional[str] = None,
+) -> str:
+    updated_text = re.sub(
+        r"\n(?:⏳ )?الحالة:.*?(?=\n|$)",
+        "",
+        original_text,
+    ).rstrip()
+    updated_text += f"\nالحالة: {status_text}"
+    if reason is not None:
+        updated_text += f"\nالسبب: {reason}"
+    return updated_text
+
+
 def order_payment_prompt(
     product_name: str, price: str
 ) -> str:
@@ -519,6 +756,50 @@ def order_payment_prompt(
         "بعد الدفع، ابعث الـID متاعك بالشكل:\n"
         "id: 123456789"
     )
+
+
+def order_admin_message(
+    order_number: int,
+    product: str,
+    price: str,
+    game_id: str,
+    user_id: int,
+    username: str,
+    payment_info: str,
+) -> str:
+    return (
+        "🛒 طلب شراء جديد\n"
+        f"رقم الطلب: #{order_number}\n"
+        f"المنتج: {product}\n"
+        f"السعر: {price}\n"
+        f"ID اللعبة: {game_id}\n"
+        f"Telegram user ID: {user_id}\n"
+        f"Username: {username}\n"
+        f"معلومة الدفع: {payment_info}\n"
+        "الحالة: pending"
+    )
+
+
+def order_admin_result_message(
+    order: dict[str, object],
+    status_text: str,
+    reason: Optional[str] = None,
+) -> str:
+    username = order.get("telegram_username")
+    formatted_username = f"@{username}" if username else "غير متوفر"
+    message = (
+        "🛒 طلب شراء\n"
+        f"رقم الطلب: #{int(order['order_number'])}\n"
+        f"المنتج: {order['product']}\n"
+        f"السعر: {order['price']}\n"
+        f"ID اللعبة: {order['game_id']}\n"
+        f"Telegram user ID: {int(order['telegram_user_id'])}\n"
+        f"Username: {formatted_username}\n"
+        f"الحالة: {status_text}"
+    )
+    if reason is not None:
+        message += f"\nالسبب: {reason}"
+    return message
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -765,11 +1046,229 @@ async def shop_cancel_callback(
     )
 
 
+async def admin_order_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    admin_id = context.application.bot_data.get("admin_id")
+    user_id = get_telegram_user_id(update)
+    if (
+        not is_private_chat(update)
+        or not isinstance(admin_id, int)
+        or user_id != admin_id
+    ):
+        await query.answer(
+            "هذا الإجراء متاح للإدمن فقط.",
+            show_alert=True,
+        )
+        return
+
+    complete_order_number = parse_order_number_callback(
+        query.data, ORDER_COMPLETE_CALLBACK_PREFIX
+    )
+    reject_order_number = parse_order_number_callback(
+        query.data, ORDER_REJECT_CALLBACK_PREFIX
+    )
+    is_completion = complete_order_number is not None
+    order_number = complete_order_number or reject_order_number
+    if order_number is None:
+        await query.answer("الطلب غير صالح.", show_alert=True)
+        return
+
+    store = get_store(context)
+    if is_completion:
+        order = store.complete_order(order_number)
+        if order is None:
+            await query.answer(
+                "الطلب تمت معالجته مسبقًا.",
+                show_alert=True,
+            )
+            return
+
+        await query.answer("تم تحديث حالة الطلب.")
+        customer_message = (
+            "✅ تم شحن طلبك بنجاح.\n"
+            "تنجم تدخل للعبة وتتأكد من وصول الجواهر/المنتج.\n"
+            f"رقم الطلب: #{order_number}"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=int(order["telegram_user_id"]),
+                text=customer_message,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify customer for completed order #%s.",
+                order_number,
+            )
+
+        if query.message is not None:
+            original_text = query.message.text or "🛒 طلب شراء"
+            updated_text = admin_order_status_text(
+                original_text,
+                "✅ تم الشحن",
+            )
+            try:
+                await query.edit_message_text(
+                    updated_text,
+                    reply_markup=None,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to update admin message for order #%s.",
+                    order_number,
+                )
+        return
+
+    if query.message is None:
+        await query.answer("تعذّر فتح الطلب.", show_alert=True)
+        return
+
+    pending_rejection = store.get_pending_admin_rejection(admin_id)
+    if (
+        pending_rejection is not None
+        and int(pending_rejection["order_number"]) != order_number
+    ):
+        await query.answer(
+            "عندك طلب آخر يستنى سبب الرفض. ابعث السبب الأول.",
+            show_alert=True,
+        )
+        return
+
+    order = store.begin_rejection(
+        admin_id=admin_id,
+        order_number=order_number,
+        admin_chat_id=query.message.chat_id,
+        admin_message_id=query.message.message_id,
+    )
+    if order is None:
+        pending_rejection = store.get_pending_admin_rejection(admin_id)
+        if (
+            pending_rejection is not None
+            and int(pending_rejection["order_number"]) == order_number
+        ):
+            await query.answer(
+                "اكتب سبب عدم الشحن في رسالة هنا.",
+                show_alert=True,
+            )
+            return
+
+        await query.answer(
+            "الطلب تمت معالجته مسبقًا.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer("في انتظار سبب عدم الشحن.")
+    original_text = query.message.text or "🛒 طلب شراء"
+    waiting_text = admin_order_status_text(
+        original_text,
+        "pending",
+    ) + "\n✍️ في انتظار سبب عدم الشحن..."
+    try:
+        await query.edit_message_text(
+            waiting_text,
+            reply_markup=None,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to update admin message for rejected order #%s.",
+            order_number,
+        )
+
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text="✍️ اكتب سبب عدم الشحن، وسيتم إرساله للزبون.",
+    )
+
+
+async def handle_admin_rejection_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    if update.message is None or not is_private_chat(update):
+        return False
+
+    admin_id = context.application.bot_data.get("admin_id")
+    user_id = get_telegram_user_id(update)
+    if not isinstance(admin_id, int) or user_id != admin_id:
+        return False
+
+    store = get_store(context)
+    pending = store.get_pending_admin_rejection(admin_id)
+    if pending is None:
+        return False
+
+    reason = update.message.text.strip()
+    if not reason:
+        await update.message.reply_text(
+            "اكتب سبب عدم الشحن في رسالة واضحة."
+        )
+        return True
+    if len(reason) > MAX_REJECTION_REASON_LENGTH:
+        await update.message.reply_text(
+            f"السبب ما يفوتش {MAX_REJECTION_REASON_LENGTH} حرف."
+        )
+        return True
+
+    order = store.reject_order(admin_id, reason)
+    if order is None:
+        await update.message.reply_text(
+            "الطلب تمت معالجته مسبقًا."
+        )
+        return True
+
+    order_number = int(order["order_number"])
+    customer_message = (
+        "❌ لم يتم شحن طلبك.\n"
+        f"السبب: {reason}\n"
+        f"رقم الطلب: #{order_number}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=int(order["telegram_user_id"]),
+            text=customer_message,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to notify customer for rejected order #%s.",
+            order_number,
+        )
+
+    updated_text = order_admin_result_message(
+        order,
+        "❌ لم يتم الشحن",
+        reason,
+    )
+    try:
+        await context.bot.edit_message_text(
+            chat_id=int(pending["admin_chat_id"]),
+            message_id=int(pending["admin_message_id"]),
+            text=updated_text,
+            reply_markup=None,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to update admin message for rejected order #%s.",
+            order_number,
+        )
+
+    await update.message.reply_text(
+        f"تم تسجيل سبب عدم الشحن للطلب #{order_number}."
+    )
+    return True
+
+
 async def handle_order_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Collect the game ID and payment info in a private chat only."""
     if update.message is None or not is_private_chat(update):
+        return
+
+    if await handle_admin_rejection_message(update, context):
         return
 
     user_id = get_telegram_user_id(update)
@@ -832,22 +1331,21 @@ async def handle_order_message(
         return
 
     admin_username = f"@{username}" if username else "غير متوفر"
-    admin_message = (
-        "🛒 طلب شراء جديد\n"
-        f"رقم الطلب: #{order_number}\n"
-        f"المنتج: {stored_product}\n"
-        f"السعر: {stored_price}\n"
-        f"ID اللعبة: {stored_game_id}\n"
-        f"Telegram user ID: {user_id}\n"
-        f"Username: {admin_username}\n"
-        f"معلومة الدفع: {text}\n"
-        "الحالة: pending"
+    admin_message = order_admin_message(
+        order_number=order_number,
+        product=stored_product,
+        price=stored_price,
+        game_id=stored_game_id,
+        user_id=user_id,
+        username=admin_username,
+        payment_info=text,
     )
 
     try:
         await context.bot.send_message(
             chat_id=admin_id,
             text=admin_message,
+            reply_markup=order_admin_keyboard(order_number),
         )
     except Exception:
         logger.exception(
@@ -907,6 +1405,15 @@ def build_application(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
             handle_order_message,
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            admin_order_callback,
+            pattern=(
+                f"^({re.escape(ORDER_COMPLETE_CALLBACK_PREFIX)}"
+                f"|{re.escape(ORDER_REJECT_CALLBACK_PREFIX)})"
+            ),
         )
     )
     application.add_handler(
